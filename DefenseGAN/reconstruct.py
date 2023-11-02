@@ -3,7 +3,7 @@ import torch.nn as nn
 from torch import optim
 
 
-def GradientDescentReconstruct(img, generator, device="cpu", L=10, R=200, lr=0.015, latent_dim=256):
+def GradientDescentReconstruct(img, generator, device="cpu", L=200, R=10, lr=0.015, latent_dim=256):
     B = img.size(0)
     img = img.repeat(R, 1, 1, 1).to(device)
     z = torch.randn((B * R, latent_dim)).to(device)

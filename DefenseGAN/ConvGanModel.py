@@ -47,7 +47,7 @@ class ConvGenerator(nn.Module):
         x = self.block3(x)
         x = self.block4(x)
         x = self.final_deconv(x)
-        x = self.out(x)
+        x = 10.0 * self.out(x)
         return x
 
 

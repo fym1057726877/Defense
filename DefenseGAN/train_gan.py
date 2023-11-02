@@ -13,9 +13,9 @@ class TrainConvGAN:
         super(TrainConvGAN, self).__init__()
         self.device = "cuda"
         self.latent_dim = 256
-        self.dis_iters = 5
-        self.g_lr = 2e-4
-        self.d_lr = 2e-4
+        self.dis_iters = 3
+        self.g_lr = 1e-4
+        self.d_lr = 1e-4
         self.generator = ConvGenerator(self.latent_dim).to(self.device)
         self.discriminator = ConvDiscriminator().to(self.device)
 
@@ -25,20 +25,20 @@ class TrainConvGAN:
         self.gen_path = os.path.join(
             get_project_path(project_name="Defense"),
             "pretrained",
-            "ConvGenerator.pth"
+            "ConvGenerator1.pth"
         )
         self.dis_path = os.path.join(
             get_project_path(project_name="Defense"),
             "pretrained",
-            "ConvDiscriminator.pth"
+            "ConvDiscriminator1.pth"
         )
 
         self.generator.load_state_dict(torch.load(self.gen_path))
         self.discriminator.load_state_dict(torch.load(self.dis_path))
 
     def train(self, epochs=100):
-        optim_g = optim.Adam(self.generator.parameters(), lr=self.g_lr, weight_decay=1e-3, betas=(0.5, 0.99))
-        optim_d = optim.Adam(self.discriminator.parameters(), lr=self.d_lr, weight_decay=1e-3, betas=(0.5, 0.99))
+        optim_g = optim.Adam(self.generator.parameters(), lr=self.g_lr, weight_decay=1e-3, betas=(0., 0.99))
+        optim_d = optim.Adam(self.discriminator.parameters(), lr=self.d_lr, weight_decay=1e-3, betas=(0., 0.99))
         lr_scheduler_g = optim.lr_scheduler.StepLR(optim_g, step_size=10, gamma=0.9)
         lr_scheduler_d = optim.lr_scheduler.StepLR(optim_d, step_size=10, gamma=0.9)
         batch_count = len(self.train_loader)
@@ -116,7 +116,7 @@ class TrainConvGAN:
 
 def trainConvGANmain():
     train_Conv_GAN = TrainConvGAN()
-    train_Conv_GAN.train(100)
+    # train_Conv_GAN.train(50)
     train_Conv_GAN.test()
 
 

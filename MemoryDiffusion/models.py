@@ -5,7 +5,7 @@ import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
 from abc import abstractmethod
-from nn import (
+from .nn import (
     conv_nd,
     linear,
     avg_pool_nd,
@@ -480,43 +480,27 @@ class GaussianDiffusion:
         loss = F.mse_loss(target, model_output)
         return loss
 
-    def get_rand_t(self, batch_size, device):
-        t = th.randint(0, self.num_timesteps, (batch_size // 2 + 1,))
-        t = th.cat([t, self.num_timesteps - t - 1], dim=0)[:batch_size]
+    def get_rand_t(self, batch_size, device, min_t=20, max_t=100):
+        if self.mean_type == ModelMeanType.EPSILON:
+            t = th.randint(0, self.num_timesteps, (batch_size // 2 + 1,))
+            t = th.cat([t, self.num_timesteps - t - 1], dim=0)[:batch_size]
+        elif self.mean_type == ModelMeanType.START_X:
+            t = th.randint(min_t, max_t, (batch_size // 2 + 1,))
+            t = th.cat([t, max_t - t - 1], dim=0)[:batch_size]
+        else:
+            raise NotImplementedError(f"{self.mean_type} not implemented")
         return t.to(device)
 
-    def get_ddim_rand_t(self, batch_size, device, num_ddim_timesteps):
-        ddim_time_steps = th.LongTensor(space_timesteps(self.num_timesteps, num_ddim_timesteps))
-        t = th.randint(0, num_ddim_timesteps, (batch_size // 2 + 1,))
-        t = th.cat([t, num_ddim_timesteps - t - 1], dim=0)[:batch_size]
-        t = ddim_time_steps[t]
-        return t.to(device)
-
-    def restore_img(
-            self,
-            model,
-            x_start,
-            t: int = 20
-    ):
+    def restore_img(self,model, x_start, t=20):
         assert 0 <= t < self.num_timesteps
         t = th.LongTensor([t] * x_start.shape[0]).to(x_start.device)
         x_t = self.q_sample(x_start=x_start, t=t)
-        pred_noise = model(x_t, t)
-        x_recon = self.predict_xstart_from_eps(x_t=x_t, t=t, eps=pred_noise)
-        return x_t, x_recon
-
-    def restore_img_0(
-            self,
-            model,
-            x_start,
-            t: int = 50
-    ):
-        assert 0 <= t < self.num_timesteps
-        t = th.LongTensor([t] * x_start.shape[0]).to(x_start.device)
-        x_t = self.q_sample(x_start=x_start, t=t)
-        restore_x = model(x_t, t)
-        return x_t, restore_x
-
+        model_output = model(x_t, t)
+        if self.mean_type == ModelMeanType.EPSILON:
+            x_recon = self.predict_xstart_from_eps(x_t=x_t, t=t, eps=model_output)
+        else:
+            x_recon = model_output
+        return x_recon
 
 
 def _extract_into_tensor(arr, t, broadcast_shape):
@@ -1027,20 +1011,256 @@ class UNetModel(nn.Module):
         return result
 
 
-def test_unet():
-    device = "cuda"
-    unet = UNetModel(
-        in_channels=3,
-        model_channels=128,
-        out_channels=3,
-        channel_mult=(1, 2, 3, 4),
-        num_res_blocks=2,
-    ).to(device)
-    x = th.randn((8, 3, 128, 128), device=device)
-    t = th.randint(0, 100, (8,), device=device)
-    out = unet(x, t)
-    print(out.shape)
+# =====================================Memory=========================================
+class Memory(nn.Module):
+    def __init__(self, MEM_DIM, features, addressing="sparse"):
+        super(Memory, self).__init__()
+
+        self.MEM_DIM = MEM_DIM
+        self.features = features
+
+        self.memory = th.zeros((self.MEM_DIM, self.features))
+        nn.init.kaiming_uniform_(self.memory)
+        self.memory = nn.Parameter(self.memory)
+
+        self.Cosine_Similiarity = nn.CosineSimilarity(dim=2)
+        self.addressing = addressing
+        if self.addressing == 'sparse':
+            self.threshold = 1 / self.MEM_DIM
+            self.epsilon = 1e-12
+
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        B = x.shape[0]
+        z = x.view(B, -1)
+        features = z.shape[1]
+        assert self.features == features
+
+        ex_mem = self.memory.unsqueeze(0).repeat(B, 1, 1)  # [b, mem_dim, fea]
+        ex_z = z.unsqueeze(1).repeat(1, self.MEM_DIM, 1)  # [b, mem_dim, fea]
+
+        mem_logit = self.Cosine_Similiarity(ex_z, ex_mem)  # [b, mem_dim]
+        mem_weight = mem_logit.softmax(dim=1)  # [b, num_mem]
+
+        # soft寻址和稀疏寻址
+        z_hat = None
+        if self.addressing == "soft":
+            z_hat = th.matmul(mem_weight, self.memory)
+        elif self.addressing == "sparse":
+            mem_weight = (self.relu(mem_weight - self.threshold) * mem_weight) \
+                         / (th.abs(mem_weight - self.threshold) + self.epsilon)
+            mem_weight = F.normalize(mem_weight, p=1, dim=1)
+            z_hat = th.matmul(mem_weight, self.memory)
+
+        assert z_hat is not None, "model parameter：addressing is wrong"
+
+        out = z_hat.view(x.shape).contiguous()
+
+        return out, mem_weight
+
+    def EntropyLoss(self, mem_weight, entropy_loss_coef=0.0002):
+        entropy_loss = -mem_weight * th.log(mem_weight + 1e-12)
+        entropy_loss = entropy_loss.sum()
+        entropy_loss *= entropy_loss_coef
+        return entropy_loss
 
 
-if __name__ == '__main__':
-    test_unet()
+# =====================================Encoder And Decoder=========================================
+class ConvEncoder(nn.Module):
+    def __init__(self, image_channels=1, conv_channels=64):
+        super(ConvEncoder, self).__init__()
+        self.image_channel = image_channels
+        self.conv_channel = conv_channels
+        self.block1 = self._conv_block(
+            in_channels=self.image_channel,
+            out_channels=self.conv_channel // 2,
+            kernel_size=1,
+            stride=2,
+            padding=0,
+        )
+        self.block2 = self._conv_block(
+            in_channels=self.conv_channel // 2,
+            out_channels=self.conv_channel,
+            kernel_size=1,
+            stride=2,
+            padding=0,
+        )
+        self.block3 = self._conv_block(
+            in_channels=self.conv_channel,
+            out_channels=self.conv_channel * 2,
+            kernel_size=1,
+            stride=2,
+            padding=0,
+        )
+        self.final_conv = nn.Conv2d(
+            in_channels=self.conv_channel * 2,
+            out_channels=self.conv_channel * 4,
+            kernel_size=1,
+            stride=2,
+            padding=0,
+        )
+
+    @staticmethod
+    def _conv_block(
+            in_channels: int,
+            out_channels: int,
+            kernel_size: int = 3,
+            stride: int = 2,
+            padding: int = 1,
+    ) -> nn.Sequential():
+        block = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding),
+            nn.BatchNorm2d(num_features=out_channels),
+            nn.ReLU(inplace=True),
+        )
+        return block
+
+    def forward(self, x):
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.block3(x)
+        x = self.final_conv(x)
+        batch_size = x.shape[0]
+        x = x.view(batch_size, -1)
+        return x
+
+
+class ConvDecoder(nn.Module):
+    def __init__(self, image_channels=1, conv_channels=64):
+        super(ConvDecoder, self).__init__()
+        self.image_channels = image_channels
+        self.conv_channels = conv_channels
+
+        self.block1 = self._transconv_block(
+            in_channels=self.conv_channels * 4,
+            out_channels=self.conv_channels * 2,
+            kernel_size=3,
+            stride=2,
+            padding=1,
+            output_padding=1,
+        )
+
+        self.block2 = self._transconv_block(
+            in_channels=self.conv_channels * 2,
+            out_channels=self.conv_channels,
+            kernel_size=3,
+            stride=2,
+            padding=1,
+            output_padding=1,
+        )
+
+        self.block3 = self._transconv_block(
+            in_channels=self.conv_channels,
+            out_channels=self.conv_channels // 2,
+            kernel_size=3,
+            stride=2,
+            padding=1,
+            output_padding=1,
+        )
+
+        self.final_transconv = nn.ConvTranspose2d(
+            in_channels=self.conv_channels // 2,
+            out_channels=image_channels,
+            kernel_size=3,
+            stride=2,
+            padding=1,
+            output_padding=1
+        )
+
+        self.out = nn.Tanh()
+
+    @staticmethod
+    def _transconv_block(
+            in_channels: int,
+            out_channels: int,
+            kernel_size: int = 3,
+            stride: int = 2,
+            padding: int = 1,
+            output_padding: int = 0,
+    ) -> nn.Sequential():
+        block = nn.Sequential(
+            nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride, padding, output_padding),
+            nn.BatchNorm2d(num_features=out_channels),
+            nn.ReLU(inplace=True),
+        )
+        return block
+
+    def forward(self, x):
+        # x:[b, self.conv_channel*4*4*4]
+        x = x.view(-1, self.conv_channels * 4, 4, 4)
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.block3(x)
+        x = self.final_transconv(x)
+        x = self.out(x)
+        return x
+
+
+# =====================================MultiHeadAttention=========================================
+class MultiHeadAttention(nn.Module):
+    def __init__(
+            self,
+            num_heads,
+            in_dim,
+            embed_dim=None,
+            threshold=0.02,
+            epsilon=1e-12,
+            drop=False,
+            droprate=0.1,
+            sparse=True,
+    ):
+        super(MultiHeadAttention, self).__init__()
+        embed_dim = embed_dim or in_dim
+        assert embed_dim % num_heads == 0  # head_num必须得被embedding_dim整除
+        self.in_dim = in_dim
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.Cosine_Similiarity = nn.CosineSimilarity(dim=-1)
+        # q,k,v个需要一个，最后拼接还需要一个，总共四个线性层
+        self.linear_q = nn.Linear(in_dim, self.embed_dim)
+        self.linear_k = nn.Linear(in_dim, self.embed_dim)
+        self.linear_v = nn.Linear(in_dim, self.embed_dim)
+
+        self.scale = 1 / math.sqrt(self.embed_dim // self.num_heads)
+
+        self.final_linear = nn.Linear(self.embed_dim, self.embed_dim)
+
+        self.drop = drop
+        if self.drop:
+            self.droprate = droprate
+            self.dropout = nn.Dropout(p=self.droprate)
+
+        self.sparse = sparse
+        if self.sparse:
+            self.threshold = threshold
+            self.epsilon = epsilon
+            self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, q, k, v):
+        B, N, L = q.shape
+        assert L == self.in_dim, f"{L} != {self.in_dim}"
+        # 进入多头处理环节
+        # 得到每个头的输入
+        dk = self.embed_dim // self.num_heads
+        q = self.linear_q(q).view(B, N, self.num_heads, dk).transpose(1, 2)  # B,H,N,dk
+        k = self.linear_k(k).view(B, N, self.num_heads, dk).transpose(1, 2)
+        v = self.linear_v(v).view(B, N, self.num_heads, dk).transpose(1, 2)
+
+        attn = self.Cosine_Similiarity(q, k).unsqueeze(2)  # B,H,N
+
+        # attn = th.matmul(q, k.transpose(1, 2)) * self.scale  # B,H,N,N
+        attn = th.softmax(attn, dim=-1)
+        if self.drop:
+            attn = self.dropout(attn)
+
+        if self.sparse:
+            # 稀疏寻址
+            attn = ((self.relu(attn - self.threshold) * attn)
+                    / (th.abs(attn - self.threshold) + self.epsilon))
+            attn = F.normalize(attn, p=1, dim=1)
+
+        out = th.matmul(attn, v)  # B,H,dk
+        out = out.view(B, -1).contiguous()
+        out = self.final_linear(out)
+        return out, attn.view(B, -1)

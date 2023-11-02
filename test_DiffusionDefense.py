@@ -2,14 +2,12 @@ import os
 import torch
 from tqdm import tqdm
 from torch.utils.data import DataLoader, TensorDataset
-from DefenseGAN.reconstruct import GradientDescentReconstruct
-from DefenseGAN.ConvGanModel import ConvGenerator
 from utils import get_project_path
 from classifier.attackClassifier import generateAdvImage
 from classifier.models import getDefinedClsModel
 from data.data_600_classes import testloader
-from utils import draw_img_groups
-
+from MemoryDiffusion.models import UNetModel, GaussianDiffusion, ModelMeanType
+from MemoryDiffusion.respace import iter_denoise
 
 # dataset_name = "Handvein"
 # dataset_name = "Handvein3"
@@ -24,17 +22,26 @@ class DirectTrainActorReconstruct:
             eps=0.03,
     ):
         super(DirectTrainActorReconstruct, self).__init__()
-        self.device = "cuda"
         self.batch_size = 20
+        self.device = "cuda"
         self.attack_dataloder = testloader
         self.attack_type = attack_type
         self.eps = eps
 
         self.num_classes = 600
 
-        self.generater = ConvGenerator(latent_dim=256).to(self.device)
-        self.save_path = os.path.join(get_project_path(project_name="Defense"), "pretrained", "ConvGenerator1.pth")
-        self.generater.load_state_dict((torch.load(self.save_path)))
+        self.diffsuion = GaussianDiffusion(mean_type=ModelMeanType.EPSILON)
+        # self.diffsuion = GaussianDiffusion(mean_type=ModelMeanType.START_X)
+        self.unet = UNetModel(
+            in_channels=1,
+            model_channels=64,
+            out_channels=1,
+            channel_mult=(1, 2, 3, 4),
+            num_res_blocks=2,
+        ).to(self.device)
+        self.save_path = os.path.join(get_project_path(project_name="Defense"), "pretrained", "diffusion.pth")
+        # self.save_path = os.path.join(get_project_path(project_name="Defense"), "pretrained", "diffusion_pred_x0.pth")
+        self.unet.load_state_dict(torch.load(self.save_path))
 
         # classifier B
         self.target_classifier_name = target_classifier_name
@@ -56,16 +63,9 @@ class DirectTrainActorReconstruct:
             f"600_{self.target_classifier_name}_{self.attack_type}_{self.eps}.pth"
         )
 
-    def defense(self, img):
-        rec = GradientDescentReconstruct(
-            img=img,
-            device=self.device,
-            generator=self.generater,
-            lr=0.001,
-            L=100,
-            R=10,
-            latent_dim=256,
-        )
+    def defense(self, img, t=50):
+        # rec = self.diffsuion.restore_img(model=self.unet, x_start=img, t=t)
+        rec = iter_denoise(unet_model=self.unet, imgs=img, t=t)
         return rec
 
     def test(self, progress=False):
@@ -91,12 +91,10 @@ class DirectTrainActorReconstruct:
 
             normal_y = self.target_classifier(img)
             normal_acc += accuracy(normal_y, label)
-            print(normal_acc)
 
             rec_img = self.defense(img)
             rec_y = self.target_classifier(rec_img)
             rec_acc += accuracy(rec_y, label)
-            print(rec_acc)
 
             adv_img = adv_img.to(self.device)
             adv_y = self.target_classifier(adv_img)
@@ -105,7 +103,6 @@ class DirectTrainActorReconstruct:
             rec_adv_img = self.defense(adv_img)
             rec_adv_y = self.target_classifier(rec_adv_img)
             rec_adv_acc += accuracy(rec_adv_y, label)
-            print(rec_adv_acc)
 
             num += label.size(0)
 
@@ -143,8 +140,8 @@ class DirectTrainActorReconstruct:
 def testDirectActor():
     # seed = 1  # the seed for random function
     torch.manual_seed(10)
-    attack_type = 'FGSM'
-    # attack_type = 'PGD'
+    # attack_type = 'FGSM'
+    attack_type = 'PGD'
     # attack_type = 'RandFGSM'
     # attack_type = 'HSJA'
     if attack_type == 'RandFGSM':
@@ -156,9 +153,9 @@ def testDirectActor():
         # eps = 0.1
         eps = 0.3
     else:
-        eps = 0.03
+        # eps = 0.03
         # eps = 0.1
-        # eps = 0.3
+        eps = 0.3
     # classifier_name = "Resnet18"
     # classifier_name = "GoogleNet"
     # classifier_name = "ModelB"

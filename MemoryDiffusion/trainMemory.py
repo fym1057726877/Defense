@@ -3,23 +3,11 @@ import torch
 import torch.nn as nn
 from torch import optim
 from tqdm import tqdm
-from gaussiandiffusion import UNetModel, GaussianDiffusion, ModelMeanType
-from encoderandmemory import EncoderAndMemory
+from models import UNetModel, GaussianDiffusion, ModelMeanType
+from models import Memory
 from utils import get_project_path
-from data.mydataset import trainloader, testloader
+from data.data_600_classes import trainloader, testloader
 from utils import draw_img_groups
-
-
-class EntropyLoss(nn.Module):
-    def __init__(self, entropy_loss_coef=0.0002):
-        super(EntropyLoss, self).__init__()
-        self.entropy_loss_coef = entropy_loss_coef
-
-    def forward(self, mem_weight):
-        entropy_loss = -mem_weight * torch.log(mem_weight + 1e-12)
-        entropy_loss = entropy_loss.sum()
-        entropy_loss *= self.entropy_loss_coef
-        return entropy_loss
 
 
 class Trainer:

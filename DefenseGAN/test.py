@@ -21,9 +21,9 @@ if __name__ == '__main__':
         img=img,
         generator=model,
         device="cuda",
-        L=10,
-        R=200,
-        lr=0.015,
+        L=200,
+        R=20,
+        lr=0.001,
         latent_dim=256
     )
     draw_img_groups([img, rec_img])

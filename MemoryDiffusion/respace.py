@@ -1,6 +1,6 @@
 import numpy as np
 import torch as th
-from gaussiandiffusion import GaussianDiffusion
+from .models import GaussianDiffusion
 
 
 def space_timesteps(num_timesteps, section_counts):
@@ -68,8 +68,8 @@ class SpacedDiffusion(GaussianDiffusion):
     :param kwargs: the kwargs to create the base diffusion process.
     """
 
-    def __init__(self, num_ddim_timesteps=100, **kwargs):
-        use_timesteps = space_timesteps(1000, section_counts=num_ddim_timesteps)
+    def __init__(self, num_ddpm_timesteps=1000, num_ddim_timesteps=100, **kwargs):
+        use_timesteps = space_timesteps(num_timesteps=num_ddpm_timesteps, section_counts=num_ddim_timesteps)
         self.use_timesteps = use_timesteps
         self.timestep_map = []   # ddim time seq
 
@@ -106,3 +106,12 @@ class _WrappedModel:
         new_ts = map_tensor[ts]
         return self.model(x, new_ts, **kwargs)
 
+
+def iter_denoise(unet_model, imgs, t=50):
+    assert t % 10 == 0
+    diffusion = GaussianDiffusion()
+    spacediffusion = SpacedDiffusion(num_ddpm_timesteps=t, num_ddim_timesteps=t//10)
+    t = th.LongTensor([t] * imgs.shape[0]).to(imgs.device)
+    x_t = diffusion.q_sample(x_start=imgs, t=t)
+    final_sample = spacediffusion.ddim_sample_loop(unet_model, shape=imgs.shape, noise=x_t, progress=False)
+    return final_sample

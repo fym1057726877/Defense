@@ -70,8 +70,8 @@ def get_TJ_PV600_Dataloader(train=True, batch_size=16, shuffle=False, transform=
     return dataloader
 
 
-trainloader = get_TJ_PV600_Dataloader(train=True, batch_size=40, shuffle=True, transform=transform_train)
-testloader = get_TJ_PV600_Dataloader(train=False, batch_size=40, shuffle=False, transform=transform_test)
+trainloader = get_TJ_PV600_Dataloader(train=True, batch_size=20, shuffle=True, transform=transform_train)
+testloader = get_TJ_PV600_Dataloader(train=False, batch_size=20, shuffle=False, transform=transform_test)
 
 
 
